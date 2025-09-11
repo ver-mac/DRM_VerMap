@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>DRM Live Device Map</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <style>
+      body {
+        margin: 0;
+        font: 14px/1.3 system-ui, Segoe UI, Roboto, Arial;
+        background: #0b0b0b;
+        color: #eaeaea;
+      }
+      header,
+      footer {
+        padding: 10px 12px;
+      }
+      #controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      select,
+      button,
+      input[type="range"] {
+        padding: 6px 8px;
+        border-radius: 10px;
+        border: 1px solid #333;
+        background: #141414;
+        color: #eee;
+      }
+      #map {
+        height: calc(100vh - 160px);
+      }
+      .pill {
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: #1e1e1e;
+        border: 1px solid #333;
+      }
+      .muted {
+        color: #aaa;
+      }
+      .panel {
+        position: absolute;
+        right: 12px;
+        top: 100px;
+        z-index: 1000;
+        background: rgba(20, 20, 20, 0.9);
+        border: 1px solid #333;
+        border-radius: 12px;
+        padding: 12px;
+        min-width: 260px;
+        max-width: 320px;
+        color: #eaeaea;
+        box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+        font-size: 13px;
+      }
+      .panel .label {
+        color: #aaa;
+      }
+      .panel code {
+        background: #111;
+        padding: 2px 5px;
+        border-radius: 6px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h2 style="margin: 4px 0 12px">DRM Live Stream Map</h2>
+      <div id="controls">
+        <span class="pill">Device:</span>
+        <select id="deviceSelect"></select>
+
+        <span class="pill">Playback:</span>
+        <button id="playPauseBtn">Play</button>
+        <button id="stepBackBtn">⟲ Back</button>
+        <button id="stepFwdBtn">⟳ Forward</button>
+
+        <span class="pill">Speed:</span>
+        <input
+          id="speed"
+          type="range"
+          min="0.25"
+          max="10"
+          value="1"
+          step="0.25"
+        />
+        <span id="speedLabel" class="muted">1×</span>
+
+        <span class="pill">Timeline:</span>
+        <input
+          id="timeline"
+          type="range"
+          min="0"
+          max="0"
+          value="0"
+          step="1"
+          style="width: 320px"
+        />
+        <span id="tlabel" class="muted">0/0</span>
+
+        <span class="pill">Live:</span>
+        <label class="muted"
+          ><input id="liveToggle" type="checkbox" checked /> follow new
+          points</label
+        >
+      </div>
+    </header>
+
+    <div id="map"></div>
+    <div id="info" class="panel"></div>
+
+    <footer class="muted">
+      Pick a device → we preload recent history then follow live points. Pause
+      to scrub; change speed as you like.
+    </footer>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script>
+      // at the top of your frontend JS
+      const clientId = localStorage.getItem("clientId") || crypto.randomUUID();
+      localStorage.setItem("clientId", clientId);
+
+      // when device changes, remember it
+      function rememberDevice(id) {
+        localStorage.setItem("selectedDeviceId", id);
+      }
+      function recallDevice() {
+        return localStorage.getItem("selectedDeviceId");
+      }
+
+      const API = window.location.origin;
+
+      // Map
+      const map = L.map("map");
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+      }).addTo(map);
+      map.setView([45.0, -73.0], 4);
+      const pathLine = L.polyline([], { weight: 4 }).addTo(map);
+      const marker = L.circleMarker([0, 0], { radius: 6 }).addTo(map);
+
+      // Controls
+      const deviceSelect = document.getElementById("deviceSelect");
+      const playPauseBtn = document.getElementById("playPauseBtn");
+      const stepBackBtn = document.getElementById("stepBackBtn");
+      const stepFwdBtn = document.getElementById("stepFwdBtn");
+      const speedInput = document.getElementById("speed");
+      const speedLabel = document.getElementById("speedLabel");
+      const liveToggle = document.getElementById("liveToggle");
+
+      // State
+      let devicesLoaded = false;
+      let currentDeviceId = null;
+      let historyReqSeq = 0; // to cancel stale history responses
+      let sse = null;
+      let buffer = []; // {ts, lat, lon}
+      let idx = -1;
+      let playing = false;
+      let baseIntervalMs = 1000;
+      let playbackTimer;
+      let devicesMap = new Map();
+      let currentDevice = null;
+
+      function setPlaying(p) {
+        playing = p;
+        playPauseBtn.textContent = p ? "Pause" : "Play";
+        if (p) startPlayback();
+        else stopPlayback();
+      }
+      function startPlayback() {
+        stopPlayback();
+        // If index is at the end, start from the beginning for a real playback
+        if (idx >= buffer.length - 1) idx = 0;
+        playbackTimer = setInterval(() => {
+          if (!buffer.length) return;
+          if (idx < buffer.length - 1) {
+            idx++;
+            renderPoint(buffer[idx]);
+            updateSlider();
+          } else if (!liveToggle.checked) {
+            // stop at end when not following live
+            setPlaying(false);
+          }
+        }, baseIntervalMs / parseFloat(speedInput.value));
+      }
+      function stopPlayback() {
+        if (playbackTimer) clearInterval(playbackTimer);
+        playbackTimer = null;
+      }
+
+      function renderPoint(p) {
+        const latlng = [p.lat, p.lon];
+        marker.setLatLng(latlng);
+
+        const html = `
+    <div>
+      <div><strong>${
+        currentDevice?.name || "(device)"
+      }</strong> <span class="label">(${(currentDeviceId || "").slice(
+          -6
+        )})</span></div>
+      <div class="label">Type:</div><div>${currentDevice?.type || "—"}</div>
+      <div class="label">FW:</div><div>${currentDevice?.fw || "—"}</div>
+      <hr style="border:none;border-top:1px solid #333;margin:8px 0">
+      <div class="label">Timestamp:</div><div>${fmtTs(p.ts)}</div>
+      <div class="label">Location:</div>
+      <div>lat <code>${fmt6(p.lat)}</code> · lon <code>${fmt6(
+          p.lon
+        )}</code></div>
+    </div>`;
+        // marker
+        //   .bindPopup(html, { autoClose: false, closeButton: false })
+        //   .openPopup();
+
+        const info = document.getElementById("info");
+        if (info) info.innerHTML = html;
+
+        // Draw path (avoid duplicates)
+        const pts = pathLine.getLatLngs();
+        if (
+          !pts.length ||
+          pts[pts.length - 1].lat !== p.lat ||
+          pts[pts.length - 1].lng !== p.lon
+        ) {
+          // pathLine.addLatLng(latlng);
+        }
+
+        if (liveToggle.checked) map.panTo(latlng, { animate: true });
+      }
+
+      stepBackBtn.onclick = () => {
+        if (!buffer.length) return;
+        idx = Math.max(0, idx - 1);
+        renderPoint(buffer[idx]);
+        setPlaying(false);
+      };
+      stepFwdBtn.onclick = () => {
+        if (!buffer.length) return;
+        idx = Math.min(buffer.length - 1, idx + 1);
+        renderPoint(buffer[idx]);
+        setPlaying(false);
+      };
+      playPauseBtn.onclick = () => setPlaying(!playing);
+      speedInput.oninput = () => {
+        speedLabel.textContent = speedInput.value + "×";
+        if (playing) startPlayback();
+      };
+
+      function resetTrack() {
+        buffer = [];
+        idx = -1;
+        pathLine.setLatLngs([]);
+        updateSlider();
+      }
+
+      function addPoints(points) {
+        buffer.push(...points);
+        if (buffer.length) {
+          idx = buffer.length - 1;
+          renderPoint(buffer[idx]);
+        }
+      }
+
+      async function loadDevices({ preserveSelection = true } = {}) {
+        const remembered = recallDevice();
+        const oldValue = preserveSelection ? deviceSelect.value : null;
+
+        const res = await fetch(`${API}/api/devices?only_connected=true`);
+        const data = await res.json();
+        const sorted = data.devices
+          .slice()
+          .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+        devicesMap = new Map(sorted.map((d) => [d.id, d]));
+
+        deviceSelect.innerHTML = "";
+        for (const d of sorted) {
+          const opt = document.createElement("option");
+          opt.value = d.id;
+          opt.textContent = `${d.name} (${d.id.slice(-6)})`;
+          deviceSelect.appendChild(opt);
+        }
+
+        if (preserveSelection && oldValue && devicesMap.has(oldValue)) {
+          deviceSelect.value = oldValue;
+        } else if (!preserveSelection && sorted.length) {
+          deviceSelect.selectedIndex = 0;
+        }
+
+        if (remembered && devicesMap.has(remembered)) {
+          deviceSelect.value = remembered;
+        } else if (!preserveSelection && sorted.length) {
+          deviceSelect.selectedIndex = 0;
+        }
+
+        if (!devicesLoaded) {
+          devicesLoaded = true;
+          if (deviceSelect.value) changeDevice(); // only once
+        }
+      }
+
+      async function preloadHistory(deviceId) {
+        // Grab up to 1000 oldest→newest (tweak as you like)
+        const res = await fetch(
+          `${API}/api/history?device_id=${encodeURIComponent(
+            deviceId
+          )}&limit=1000&asc=true`
+        );
+        const data = await res.json();
+        addPoints(data.list);
+      }
+
+      function changeDevice() {
+        const selectedId = deviceSelect.value;
+        if (!selectedId) return;
+
+        rememberDevice(selectedId);
+        // close previous SSE & reset
+        if (sse) {
+          sse.close();
+          sse = null;
+        }
+        resetTrack();
+        setPlaying(false);
+
+        currentDeviceId = selectedId;
+        currentDevice = devicesMap.get(selectedId) || {
+          id: selectedId,
+          name: selectedId,
+        };
+
+        // 1) Preload history (guard against stale response)
+        const mySeq = ++historyReqSeq;
+        (async () => {
+          try {
+            const res = await fetch(
+              `${API}/api/history?device_id=${encodeURIComponent(
+                selectedId
+              )}&limit=10000&asc=true`
+            );
+            const data = await res.json();
+            if (mySeq !== historyReqSeq || currentDeviceId !== selectedId)
+              return;
+            buffer = data.list || [];
+            // Start from the beginning so Play actually plays
+            idx = buffer.length ? 0 : -1;
+            if (idx >= 0) {
+              renderPoint(buffer[idx]);
+            }
+            updateSlider();
+          } catch (e) {
+            console.error(e);
+          }
+        })();
+
+        // 2) Attach SSE for live points (append and keep slider in sync)
+        sse = new EventSource(
+          `${API}/api/stream/location/${encodeURIComponent(
+            selectedId
+          )}?stream=location&client_id=${encodeURIComponent(clientId)}`
+        );
+        sse.onmessage = (evt) => {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (currentDeviceId !== selectedId) return; // stale
+            if (typeof msg.lat === "number" && typeof msg.lon === "number") {
+              buffer.push(msg);
+              // If following live *and* not playing, jump to newest
+              if (!playing && liveToggle.checked) {
+                idx = buffer.length - 1;
+                renderPoint(msg);
+              }
+              updateSlider();
+            }
+          } catch (e) {
+            console.warn("Bad SSE payload", e, evt.data);
+          }
+        };
+        sse.onerror = (e) => console.warn("SSE error", e);
+      }
+
+      function fmt6(n) {
+        return (Math.round(n * 1e6) / 1e6).toFixed(6);
+      }
+
+      function fmtTs(ts) {
+        return ts ? String(ts).replace("T", " ").replace("Z", "Z") : "—";
+      }
+
+      function updateSlider() {
+        const max = Math.max(0, buffer.length - 1);
+        timeline.max = String(max);
+        timeline.value = String(Math.max(0, Math.min(idx, max)));
+        tlabel.textContent = `${buffer.length ? idx + 1 : 0}/${buffer.length}`;
+      }
+
+      function infoHtml(p) {
+        const d = currentDevice || {};
+        const idTail = (d.id || "").slice(-6);
+        return `
+    <div>
+      <div><strong>${
+        d.name || "(Unnamed device)"
+      }</strong> <span class="label">(${idTail})</span></div>
+      <div class="label">Type:</div><div>${d.type || "—"}</div>
+      <div class="label">FW:</div><div>${d.fw || "—"}</div>
+      <hr style="border:none;border-top:1px solid #333;margin:8px 0">
+      <div class="label">Timestamp:</div><div>${
+        p.ts || p.timestamp || "—"
+      }</div>
+      <div class="label">Location:</div>
+      <div>lat <code>${fmt6(p.lat)}</code> · lon <code>${fmt6(
+          p.lon
+        )}</code></div>
+    </div>
+  `;
+      }
+
+      // call once on startup; do NOT call again automatically
+      loadDevices({ preserveSelection: true }).catch(console.error);
+
+      // keep this
+      deviceSelect.onchange = changeDevice;
+
+      timeline.oninput = () => {
+        if (!buffer.length) return;
+        idx = parseInt(timeline.value, 10) || 0;
+        renderPoint(buffer[idx]);
+        setPlaying(false); // scrubbing pauses playback
+        updateSlider();
+      };
+
+      stepBackBtn.onclick = () => {
+        if (!buffer.length) return;
+        idx = Math.max(0, idx - 1);
+        renderPoint(buffer[idx]);
+        setPlaying(false);
+        updateSlider();
+      };
+
+      stepFwdBtn.onclick = () => {
+        if (!buffer.length) return;
+        idx = Math.min(buffer.length - 1, idx + 1);
+        renderPoint(buffer[idx]);
+        setPlaying(false);
+        updateSlider();
+      };
+
+      playPauseBtn.onclick = () => setPlaying(!playing);
+
+      speedInput.oninput = () => {
+        speedLabel.textContent = speedInput.value + "×";
+        if (playing) startPlayback(); // restart loop with new speed
+      };
+    </script>
+  </body>
+</html>
