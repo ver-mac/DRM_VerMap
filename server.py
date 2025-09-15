@@ -14,7 +14,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # IMPORTANT: only import modules that read env AFTER load_dotenv
-from db import init_db, upsert_devices, insert_locations, last_ts_for_device, query_history
+from db import (
+    init_db,
+    upsert_devices,
+    insert_locations,
+    last_ts_for_device,
+    query_history,
+    list_devices,
+)
 from digirm import device_rows_for_db, fetch_stream_history, fetch_stream_latest, parse_latlon
 from sse import broker
 
@@ -90,23 +97,41 @@ pollers = PollerManager()
 @app.on_event("startup")
 async def on_startup():
     await init_db()
-    # Optional: prime devices table (connected only)
-    rows = await device_rows_for_db(only_connected=True)
+    # Optional: prime devices table with all devices
+    rows = await device_rows_for_db(only_connected=False)
     await upsert_devices(rows)
 
 # ---- routes ----
 
 @app.get("/api/devices")
-async def api_devices(only_connected: bool = True, size: int = 1000):
-    rows = await device_rows_for_db(only_connected=only_connected, size=size)
-    await upsert_devices(rows)
+async def api_devices(limit: int = 1000):
+    rows = await list_devices(limit=limit)
     return {"count": len(rows), "devices": rows}
 
 @app.get("/api/history")
 async def api_history(device_id: str, start: str | None = None, end: str | None = None, limit: int = 1000, asc: bool = True):
     if not device_id:
         raise HTTPException(400, "device_id is required")
+    
     data = await query_history(device_id, start=start, end=end, limit=limit, asc=asc)
+    # If no records were found, attempt a one-shot fetch from DRM and persist
+    if start and not data:
+        try:
+            hist = await fetch_stream_history(device_id, stream="location", start_time=start, size=limit)
+            new_rows = []
+            for p in hist.get("list", []):
+                ts = p.get("timestamp")
+                val = p.get("value")
+                parsed = parse_latlon(val)
+                if ts and parsed:
+                    lat, lon = parsed
+                    new_rows.append((device_id, ts, lat, lon, None, "stream:location"))
+            if new_rows:
+                await insert_locations(new_rows)
+                data = await query_history(device_id, start=start, end=end, limit=limit, asc=asc)
+        except Exception:
+            pass
+
     return {"count": len(data), "list": data}
 
 @app.get("/api/location/latest")
