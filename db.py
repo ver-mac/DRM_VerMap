@@ -88,3 +88,17 @@ async def query_history(device_id: str, start: str = None, end: str = None, limi
             rows = await cur.fetchall()
             # Return oldest→newest by default
             return [{"ts": r[0], "lat": r[1], "lon": r[2]} for r in rows]
+
+async def list_devices(limit: int | None = None):
+    sql = "SELECT id, name, type, fw FROM devices ORDER BY name"
+    params = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [
+                {"id": r[0], "name": r[1], "type": r[2], "fw": r[3]}
+                for r in rows
+            ]

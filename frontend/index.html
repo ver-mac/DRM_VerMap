@@ -29,7 +29,8 @@
       }
       select,
       button,
-      input[type="range"] {
+      input[type="range"],
+      input[type="date"] {
         padding: 6px 8px;
         border-radius: 10px;
         border: 1px solid #333;
@@ -71,6 +72,15 @@
         padding: 2px 5px;
         border-radius: 6px;
       }
+      .device-icon {
+        width: 40px;
+        height: 40px;
+        background: #fff url("./img/worker.jpg") center/cover no-repeat;
+        border-radius: 50%;
+        border: 2px solid #000;
+        box-shadow: 0 0 6px rgba(0, 0, 0, 0.5);
+        cursor: pointer;
+      }
     </style>
   </head>
   <body>
@@ -79,11 +89,14 @@
       <div id="controls">
         <span class="pill">Device:</span>
         <select id="deviceSelect"></select>
+        <span class="pill">Date:</span>
+        <input id="datePicker" type="date" />
 
         <span class="pill">Playback:</span>
+
         <button id="playPauseBtn">Play</button>
         <button id="stepBackBtn">⟲ Back</button>
-        <button id="stepFwdBtn">⟳ Forward</button>
+        <button id="stepFwdBtn">⟳ Next</button>
 
         <span class="pill">Speed:</span>
         <input
@@ -150,9 +163,28 @@
         maxZoom: 19,
       }).addTo(map);
       map.setView([45.0, -73.0], 4);
+      const FOLLOW_ZOOM_LEVEL = 17;
+      let manualZoomLevel = null;
+      let programmaticZoomChange = false;
+      map.on("zoomend", () => {
+        if (programmaticZoomChange) {
+          programmaticZoomChange = false;
+        } else {
+          manualZoomLevel = map.getZoom();
+        }
+      });
       const pathLine = L.polyline([], { weight: 4 }).addTo(map);
-      const marker = L.circleMarker([0, 0], { radius: 6 }).addTo(map);
-
+      const deviceIcon = L.divIcon({
+        className: "device-icon",
+        iconSize: [40, 40],
+        iconAnchor: [20, 20],
+      });
+      const marker = L.marker([0, 0], { icon: deviceIcon }).addTo(map);
+      marker.on("click", () => {
+        const latlng = marker.getLatLng();
+        if (!latlng) return;
+        focusOnDevice(latlng, { resetZoom: true });
+      });
       // Controls
       const deviceSelect = document.getElementById("deviceSelect");
       const playPauseBtn = document.getElementById("playPauseBtn");
@@ -161,6 +193,14 @@
       const speedInput = document.getElementById("speed");
       const speedLabel = document.getElementById("speedLabel");
       const liveToggle = document.getElementById("liveToggle");
+      const datePicker = document.getElementById("datePicker");
+
+      function localDateString(d = new Date()) {
+        d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+        return d.toISOString().slice(0, 10);
+      }
+
+      datePicker.value = localDateString();
 
       // State
       let devicesLoaded = false;
@@ -202,26 +242,43 @@
         playbackTimer = null;
       }
 
+      function focusOnDevice(latlng, { resetZoom = false } = {}) {
+        if (!latlng) return;
+        if (resetZoom) {
+          manualZoomLevel = null;
+        }
+        const targetZoom = manualZoomLevel ?? FOLLOW_ZOOM_LEVEL;
+        const currentZoom = map.getZoom();
+        const shouldAdjustZoom = targetZoom !== currentZoom;
+        if (shouldAdjustZoom) {
+          programmaticZoomChange = true;
+        }
+        map.setView(latlng, targetZoom, { animate: true });
+        if (!shouldAdjustZoom) {
+          programmaticZoomChange = false;
+        }
+      }
+
       function renderPoint(p) {
         const latlng = [p.lat, p.lon];
         marker.setLatLng(latlng);
 
         const html = `
-    <div>
-      <div><strong>${
-        currentDevice?.name || "(device)"
-      }</strong> <span class="label">(${(currentDeviceId || "").slice(
+        <div>
+          <div><strong>${
+            currentDevice?.name || "(device)"
+          }</strong> <span class="label">(${(currentDeviceId || "").slice(
           -6
         )})</span></div>
-      <div class="label">Type:</div><div>${currentDevice?.type || "—"}</div>
-      <div class="label">FW:</div><div>${currentDevice?.fw || "—"}</div>
-      <hr style="border:none;border-top:1px solid #333;margin:8px 0">
-      <div class="label">Timestamp:</div><div>${fmtTs(p.ts)}</div>
-      <div class="label">Location:</div>
-      <div>lat <code>${fmt6(p.lat)}</code> · lon <code>${fmt6(
+          <div class="label">Type:</div><div>${currentDevice?.type || "—"}</div>
+          <div class="label">FW:</div><div>${currentDevice?.fw || "—"}</div>
+          <hr style="border:none;border-top:1px solid #333;margin:8px 0">
+          <div class="label">Timestamp:</div><div>${fmtTs(p.ts)}</div>
+          <div class="label">Location:</div>
+          <div>lat <code>${fmt6(p.lat)}</code> · lon <code>${fmt6(
           p.lon
         )}</code></div>
-    </div>`;
+        </div>`;
         // marker
         //   .bindPopup(html, { autoClose: false, closeButton: false })
         //   .openPopup();
@@ -239,7 +296,7 @@
           // pathLine.addLatLng(latlng);
         }
 
-        if (liveToggle.checked) map.panTo(latlng, { animate: true });
+        if (liveToggle.checked) focusOnDevice(latlng);
       }
 
       stepBackBtn.onclick = () => {
@@ -279,7 +336,7 @@
         const remembered = recallDevice();
         const oldValue = preserveSelection ? deviceSelect.value : null;
 
-        const res = await fetch(`${API}/api/devices?only_connected=true`);
+        const res = await fetch(`${API}/api/devices`);
         const data = await res.json();
         const sorted = data.devices
           .slice()
@@ -343,15 +400,22 @@
         };
 
         // 1) Preload history (guard against stale response)
+        const day = datePicker.value;
         const mySeq = ++historyReqSeq;
         (async () => {
           try {
-            const res = await fetch(
-              `${API}/api/history?device_id=${encodeURIComponent(
-                selectedId
-              )}&limit=10000&asc=true`
-            );
+            const params = new URLSearchParams({
+              device_id: selectedId,
+              limit: "10000",
+              asc: "true",
+            });
+            if (day) {
+              params.set("start", day + "T00:00:00Z");
+              params.set("end", day + "T23:59:59Z");
+            }
+            const res = await fetch(`${API}/api/history?${params.toString()}`);
             const data = await res.json();
+
             if (mySeq !== historyReqSeq || currentDeviceId !== selectedId)
               return;
             buffer = data.list || [];
@@ -366,30 +430,36 @@
           }
         })();
 
-        // 2) Attach SSE for live points (append and keep slider in sync)
-        sse = new EventSource(
-          `${API}/api/stream/location/${encodeURIComponent(
-            selectedId
-          )}?stream=location&client_id=${encodeURIComponent(clientId)}`
-        );
-        sse.onmessage = (evt) => {
-          try {
-            const msg = JSON.parse(evt.data);
-            if (currentDeviceId !== selectedId) return; // stale
-            if (typeof msg.lat === "number" && typeof msg.lon === "number") {
-              buffer.push(msg);
-              // If following live *and* not playing, jump to newest
-              if (!playing && liveToggle.checked) {
-                idx = buffer.length - 1;
-                renderPoint(msg);
+        // 2) Attach SSE for live points only when following today
+        const today = new Date().toISOString().slice(0, 10);
+        if (liveToggle.checked && day === today) {
+          sse = new EventSource(
+            `${API}/api/stream/location/${encodeURIComponent(
+              selectedId
+            )}?stream=location&client_id=${encodeURIComponent(clientId)}`
+          );
+          sse.onmessage = (evt) => {
+            try {
+              const msg = JSON.parse(evt.data);
+              if (currentDeviceId !== selectedId) return; // stale
+              if (typeof msg.lat === "number" && typeof msg.lon === "number") {
+                const last = buffer[buffer.length - 1];
+                if (!last || last.ts !== msg.ts) {
+                  buffer.push(msg);
+                  // If following live *and* not playing, jump to newest
+                  if (!playing && liveToggle.checked) {
+                    idx = buffer.length - 1;
+                    renderPoint(msg);
+                  }
+                  updateSlider();
+                }
               }
-              updateSlider();
+            } catch (e) {
+              console.warn("Bad SSE payload", e, evt.data);
             }
-          } catch (e) {
-            console.warn("Bad SSE payload", e, evt.data);
-          }
-        };
-        sse.onerror = (e) => console.warn("SSE error", e);
+          };
+          sse.onerror = (e) => console.warn("SSE error", e);
+        }
       }
 
       function fmt6(n) {
@@ -411,22 +481,22 @@
         const d = currentDevice || {};
         const idTail = (d.id || "").slice(-6);
         return `
-    <div>
-      <div><strong>${
-        d.name || "(Unnamed device)"
-      }</strong> <span class="label">(${idTail})</span></div>
-      <div class="label">Type:</div><div>${d.type || "—"}</div>
-      <div class="label">FW:</div><div>${d.fw || "—"}</div>
-      <hr style="border:none;border-top:1px solid #333;margin:8px 0">
-      <div class="label">Timestamp:</div><div>${
-        p.ts || p.timestamp || "—"
-      }</div>
-      <div class="label">Location:</div>
-      <div>lat <code>${fmt6(p.lat)}</code> · lon <code>${fmt6(
+        <div>
+          <div><strong>${
+            d.name || "(Unnamed device)"
+          }</strong> <span class="label">(${idTail})</span></div>
+          <div class="label">Type:</div><div>${d.type || "—"}</div>
+          <div class="label">FW:</div><div>${d.fw || "—"}</div>
+          <hr style="border:none;border-top:1px solid #333;margin:8px 0">
+          <div class="label">Timestamp:</div><div>${
+            p.ts || p.timestamp || "—"
+          }</div>
+          <div class="label">Location:</div>
+          <div>lat <code>${fmt6(p.lat)}</code> · lon <code>${fmt6(
           p.lon
         )}</code></div>
-    </div>
-  `;
+        </div>
+      `;
       }
 
       // call once on startup; do NOT call again automatically
@@ -434,6 +504,12 @@
 
       // keep this
       deviceSelect.onchange = changeDevice;
+      datePicker.onchange = () => {
+        if (currentDeviceId) changeDevice();
+      };
+      liveToggle.onchange = () => {
+        if (currentDeviceId) changeDevice();
+      };
 
       timeline.oninput = () => {
         if (!buffer.length) return;
