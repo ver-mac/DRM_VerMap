@@ -361,10 +361,10 @@
         };
 
         // 1) Preload history (guard against stale response)
+        const day = datePicker.value;
         const mySeq = ++historyReqSeq;
         (async () => {
           try {
-            const day = datePicker.value;
             const params = new URLSearchParams({
               device_id: selectedId,
               limit: "10000",
@@ -404,13 +404,16 @@
               const msg = JSON.parse(evt.data);
               if (currentDeviceId !== selectedId) return; // stale
               if (typeof msg.lat === "number" && typeof msg.lon === "number") {
-                buffer.push(msg);
-                // If following live *and* not playing, jump to newest
-                if (!playing && liveToggle.checked) {
-                  idx = buffer.length - 1;
-                  renderPoint(msg);
+                const last = buffer[buffer.length - 1];
+                if (!last || last.ts !== msg.ts) {
+                  buffer.push(msg);
+                  // If following live *and* not playing, jump to newest
+                  if (!playing && liveToggle.checked) {
+                    idx = buffer.length - 1;
+                    renderPoint(msg);
+                  }
+                  updateSlider();
                 }
-                updateSlider();
               }
             } catch (e) {
               console.warn("Bad SSE payload", e, evt.data);
@@ -418,7 +421,6 @@
           };
           sse.onerror = (e) => console.warn("SSE error", e);
         }
-
       }
 
       function fmt6(n) {
@@ -463,12 +465,12 @@
 
       // keep this
       deviceSelect.onchange = changeDevice;
-        datePicker.onchange = () => {
-          if (currentDeviceId) changeDevice();
-        };
-        liveToggle.onchange = () => {
-          if (currentDeviceId) changeDevice();
-        };
+      datePicker.onchange = () => {
+        if (currentDeviceId) changeDevice();
+      };
+      liveToggle.onchange = () => {
+        if (currentDeviceId) changeDevice();
+      };
 
       timeline.oninput = () => {
         if (!buffer.length) return;
