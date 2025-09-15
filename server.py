@@ -143,7 +143,9 @@ async def api_location_latest(device_id: str = Query(...), stream: str = Query("
     if not coords:
         raise HTTPException(422, "Could not parse lat/lon from latest value")
     lat, lon = coords
-    return {"device_id": device_id, "stream": stream, "ts": latest.get("timestamp"), "lat": lat, "lon": lon}
+    ts = latest.get("timestamp")
+    await insert_locations([(device_id, ts, lat, lon, None, f"stream:{stream}")])
+    return {"device_id": device_id, "stream": stream, "ts": ts, "lat": lat, "lon": lon}
 
 @app.get("/api/stream/location/{device_id}")
 async def sse_location(request: Request, device_id: str, stream: str = "location"):

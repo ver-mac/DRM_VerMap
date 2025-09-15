@@ -72,6 +72,15 @@
         padding: 2px 5px;
         border-radius: 6px;
       }
+      .device-icon {
+        width: 40px;
+        height: 40px;
+        background: #fff url("./img/worker.jpg") center/cover no-repeat;
+        border-radius: 50%;
+        border: 2px solid #000;
+        box-shadow: 0 0 6px rgba(0, 0, 0, 0.5);
+        cursor: pointer;
+      }
     </style>
   </head>
   <body>
@@ -80,7 +89,6 @@
       <div id="controls">
         <span class="pill">Device:</span>
         <select id="deviceSelect"></select>
-        <span class="pill">Playback:</span>
         <span class="pill">Date:</span>
         <input id="datePicker" type="date" />
 
@@ -155,14 +163,28 @@
         maxZoom: 19,
       }).addTo(map);
       map.setView([45.0, -73.0], 4);
+      const FOLLOW_ZOOM_LEVEL = 17;
+      let manualZoomLevel = null;
+      let programmaticZoomChange = false;
+      map.on("zoomend", () => {
+        if (programmaticZoomChange) {
+          programmaticZoomChange = false;
+        } else {
+          manualZoomLevel = map.getZoom();
+        }
+      });
       const pathLine = L.polyline([], { weight: 4 }).addTo(map);
-      const deviceIcon = L.icon({
-        iconUrl: "./img/worker.jpg",
-        iconSize: [24, 24],
-        iconAnchor: [12, 12],
+      const deviceIcon = L.divIcon({
+        className: "device-icon",
+        iconSize: [40, 40],
+        iconAnchor: [20, 20],
       });
       const marker = L.marker([0, 0], { icon: deviceIcon }).addTo(map);
-
+      marker.on("click", () => {
+        const latlng = marker.getLatLng();
+        if (!latlng) return;
+        focusOnDevice(latlng, { resetZoom: true });
+      });
       // Controls
       const deviceSelect = document.getElementById("deviceSelect");
       const playPauseBtn = document.getElementById("playPauseBtn");
@@ -220,6 +242,23 @@
         playbackTimer = null;
       }
 
+      function focusOnDevice(latlng, { resetZoom = false } = {}) {
+        if (!latlng) return;
+        if (resetZoom) {
+          manualZoomLevel = null;
+        }
+        const targetZoom = manualZoomLevel ?? FOLLOW_ZOOM_LEVEL;
+        const currentZoom = map.getZoom();
+        const shouldAdjustZoom = targetZoom !== currentZoom;
+        if (shouldAdjustZoom) {
+          programmaticZoomChange = true;
+        }
+        map.setView(latlng, targetZoom, { animate: true });
+        if (!shouldAdjustZoom) {
+          programmaticZoomChange = false;
+        }
+      }
+
       function renderPoint(p) {
         const latlng = [p.lat, p.lon];
         marker.setLatLng(latlng);
@@ -257,7 +296,7 @@
           // pathLine.addLatLng(latlng);
         }
 
-        if (liveToggle.checked) map.panTo(latlng, { animate: true });
+        if (liveToggle.checked) focusOnDevice(latlng);
       }
 
       stepBackBtn.onclick = () => {
